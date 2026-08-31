@@ -23,11 +23,11 @@ from aiohttp import ClientTimeout, TCPConnector
 # ==========================================
 
 DEFAULT_TOKENS = (
-    "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,"
-    "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,"
-    "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,"
-    "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,"
-    "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"
+    "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,"
+    "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,"
+    "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,"
+    "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,"
+    "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"
 )
 
 # ---- 双 Webhook 配置 ----
