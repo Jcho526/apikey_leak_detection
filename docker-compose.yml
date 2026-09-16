@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  deepseek-scanner:
+    build: .
+    container_name: deepseek-scanner
+    restart: always
+    volumes:
+      # 持久化去重文件，重启/更新容器不会丢历史
+      - ./data:/data
+    # 如果以后想用环境变量覆盖 Token / Webhook，可以在这里加
+    # environment:
+    #   - GITHUB_TOKENS=ghp_xxx,ghp_yyy
+    #   - WECOM_LOG_WEBHOOK=https://...
+    #   - WECOM_ALERT_WEBHOOK=https://...
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
