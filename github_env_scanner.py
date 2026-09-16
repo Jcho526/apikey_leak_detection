@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepSeek API Key Leak Scanner — Async 3.2 (Production Ready)
+DeepSeek API Key Leak Scanner — Async 3.3 (Bugfix)
 全异步架构：并行关键词搜索 + 流式仓库扫描 + 智能令牌池 + 智能重试抖动 + 告警去重
 """
 
@@ -35,17 +35,23 @@ GITHUB_TOKENS = [t.strip() for t in GITHUB_TOKENS_ENV.split(",") if t.strip()]
 WECOM_LOG_WEBHOOK = os.getenv("WECOM_LOG_WEBHOOK", DEFAULT_LOG_WEBHOOK)
 WECOM_ALERT_WEBHOOK = os.getenv("WECOM_ALERT_WEBHOOK", DEFAULT_ALERT_WEBHOOK)
 
-# 并发控制
-MAX_SEARCH_CONCURRENT = 10          
-MAX_REPO_SCAN_CONCURRENT = 30       
-MAX_FILE_SCAN_CONCURRENT = 50       
-MAX_KEY_VERIFY_CONCURRENT = 20      
-SEARCH_PER_PAGE = 100               
-MAX_SEARCH_PAGES = 5                
+# 并发控制（已下调搜索并发，降低被 Search 限流概率）
+MAX_SEARCH_CONCURRENT = 4
+MAX_REPO_SCAN_CONCURRENT = 25
+MAX_FILE_SCAN_CONCURRENT = 40
+MAX_KEY_VERIFY_CONCURRENT = 15
+SEARCH_PER_PAGE = 100
+MAX_SEARCH_PAGES = 5
 
 # 进度推送间隔
-PROGRESS_REPO_INTERVAL = 5          
-PROGRESS_TIME_INTERVAL = 30         
+PROGRESS_REPO_INTERVAL = 5
+PROGRESS_TIME_INTERVAL = 30
+
+# 主循环每轮结束后的休息时间（秒）
+ROUND_SLEEP = 15
+
+# 文件大小上限（字节），超过则跳过
+MAX_FILE_SIZE = 500_000
 
 # ==========================================
 # 关键词矩阵
@@ -74,7 +80,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = "/data" if os.path.exists("/data") else "."
 SEEN_KEYS_FILE = os.path.join(DATA_DIR, "seen_keys.json")
 SEEN_REPOS_FILE = os.path.join(DATA_DIR, "seen_repos.json")
-SENT_ALERTS_FILE = os.path.join(DATA_DIR, "sent_alerts.json")  # 告警去重持久化文件
+SENT_ALERTS_FILE = os.path.join(DATA_DIR, "sent_alerts.json")
 
 TARGET_EXTS = (
     '.py', '.js', '.json', '.env', '.yml', '.yaml', '.txt', '.ts',
@@ -96,7 +102,13 @@ class TokenPool:
 
     def __init__(self, tokens):
         self._pool = {
-            t: {"remaining": 5000, "reset_at": 0, "locked_until": 0, "last_used": 0}
+            t: {
+                "remaining": 5000,
+                "reset_at": 0,
+                "locked_until": 0,
+                "last_used": 0,
+                "invalid": False,
+            }
             for t in tokens
         }
         self._lock = asyncio.Lock()
@@ -105,7 +117,9 @@ class TokenPool:
         now = time.time()
         parts = []
         for i, s in enumerate(self._pool.values()):
-            if now < s["locked_until"]:
+            if s.get("invalid"):
+                parts.append(f"T{i+1}: 无效")
+            elif now < s["locked_until"]:
                 parts.append(f"T{i+1}: 限速中")
             elif s["remaining"] <= 0 and now < s["reset_at"]:
                 parts.append(f"T{i+1}: 耗尽")
@@ -118,25 +132,35 @@ class TokenPool:
             async with self._lock:
                 now = time.time()
                 for token, state in self._pool.items():
+                    if state.get("invalid"):
+                        continue
                     if now < state["locked_until"]:
                         continue
                     if state["remaining"] <= 0 and now < state["reset_at"]:
                         continue
-                    state["remaining"] -= 1
+                    # 不再在这里预扣减，等请求成功后再扣
                     state["last_used"] = now
                     return token, state
 
             min_wait = min(
-                (s["locked_until"] - time.time() if time.time() < s["locked_until"]
-                 else s["reset_at"] - time.time() if s["remaining"] <= 0
-                 else 0)
+                (
+                    s["locked_until"] - time.time()
+                    if time.time() < s["locked_until"]
+                    else s["reset_at"] - time.time()
+                    if s["remaining"] <= 0
+                    else 0
+                )
                 for s in self._pool.values()
-            )
-            wait = max(min_wait, 0.1)
+                if not s.get("invalid")
+            ) if any(not s.get("invalid") for s in self._pool.values()) else 5
+            wait = max(min_wait, 0.2)
             await asyncio.sleep(wait)
 
-    async def update(self, _token, state, headers):
+    async def update(self, token, state, headers, success=True):
         async with self._lock:
+            if success and state["remaining"] > 0:
+                state["remaining"] -= 1
+
             remaining = headers.get("X-RateLimit-Remaining")
             reset_at = headers.get("X-RateLimit-Reset")
             if remaining is not None:
@@ -156,11 +180,15 @@ class TokenPool:
                 base_wait = int(retry_after) if retry_after else 60
             except ValueError:
                 base_wait = 60
-            # 引入随机抖动 (±20%) 避免惊群效应
             wait = base_wait * random.uniform(0.8, 1.2)
             state["locked_until"] = time.time() + wait
             state["remaining"] = 0
             logger.warning(f"🚫 Token {token[:15]}... 被限速，将等待 {wait:.1f}s")
+
+    async def mark_invalid(self, token, state):
+        async with self._lock:
+            state["invalid"] = True
+            logger.error(f"❌ Token {token[:15]}... 已标记为无效（401）")
 
 
 # ==========================================
@@ -181,13 +209,13 @@ class AsyncGitHubClient:
 
     async def __aenter__(self):
         connector = TCPConnector(
-            limit=500,
-            limit_per_host=200,
+            limit=400,
+            limit_per_host=150,
             ttl_dns_cache=300,
             force_close=False,
             enable_cleanup_closed=True,
         )
-        timeout = ClientTimeout(total=15, connect=5)
+        timeout = ClientTimeout(total=18, connect=6)
         self._session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
@@ -210,15 +238,20 @@ class AsyncGitHubClient:
 
             try:
                 async with self._session.get(url, headers=headers) as resp:
-                    await self.token_pool.update(token, state, resp.headers)
-
                     if resp.status == 200:
+                        await self.token_pool.update(token, state, resp.headers, success=True)
                         if accept_raw:
                             return await resp.text()
                         else:
                             return await resp.json()
 
-                    elif resp.status in (401, 403, 429):
+                    elif resp.status == 401:
+                        await self.token_pool.mark_invalid(token, state)
+                        if attempt < max_attempts - 1:
+                            continue
+                        return None
+
+                    elif resp.status in (403, 429):
                         retry_after = resp.headers.get("Retry-After", "60")
                         await self.token_pool.mark_rate_limited(token, state, retry_after)
                         if attempt < max_attempts - 1:
@@ -226,15 +259,16 @@ class AsyncGitHubClient:
                         return None
 
                     elif resp.status == 404:
+                        await self.token_pool.update(token, state, resp.headers, success=True)
                         return None
 
                     else:
+                        await self.token_pool.update(token, state, resp.headers, success=True)
                         return None
 
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 if attempt < max_attempts - 1:
-                    # 指数退避 + 随机抖动重试
-                    sleep_time = (2 ** attempt) + random.uniform(0.1, 0.5)
+                    sleep_time = (2 ** attempt) + random.uniform(0.1, 0.6)
                     await asyncio.sleep(sleep_time)
                     continue
                 return None
@@ -306,7 +340,7 @@ class DeepSeekScanner:
         self.client = client
         self.seen_keys = self._load_json_set(SEEN_KEYS_FILE)
         self.seen_repos = self._load_json_set(SEEN_REPOS_FILE)
-        self.sent_alerts = self._load_json_set(SENT_ALERTS_FILE)  # 告警去重集合
+        self.sent_alerts = self._load_json_set(SENT_ALERTS_FILE)
         self.time_threshold = (datetime.now(timezone.utc) - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
         self.stats = {"keys_found": 0, "keys_valid": 0, "repos_scanned": 0, "rounds": 0}
         self._file_lock = asyncio.Lock()
@@ -331,7 +365,9 @@ class DeepSeekScanner:
             except Exception as e:
                 logger.error(f"保存文件失败 {path}: {e}")
 
-    def _is_target_file(self, path):
+    def _is_target_file(self, path, size=0):
+        if size > MAX_FILE_SIZE:
+            return False
         lower = path.lower()
         if lower.endswith(TARGET_EXTS):
             return True
@@ -367,20 +403,19 @@ class DeepSeekScanner:
         return all_keys
 
     async def _verify_and_report(self, owner, repo, filepath, key):
+        # 先验证，成功后再写入 seen_keys，避免验证中途崩溃导致永久跳过
+        valid, balance = await self.client.verify_key(key)
+
         self.seen_keys.add(key)
         await self._save_json_async(SEEN_KEYS_FILE, self.seen_keys)
         self.stats["keys_found"] += 1
 
         logger.info(f"🎯 捕获疑似 Key: {key[:8]}... 来源: {owner}/{repo}/{filepath}")
 
-        valid, balance = await self.client.verify_key(key)
         if valid:
             self.stats["keys_valid"] += 1
             logger.warning(f"✅ 有效 Key! {key[:8]}...{key[-4:]} 余额: {balance}")
 
-            # -------------------------------------------------------------
-            # 逻辑修复：告警去重检查（防止同一个 Key 在多个地方泄漏被反复轰炸）
-            # -------------------------------------------------------------
             if key not in self.sent_alerts:
                 self.sent_alerts.add(key)
                 await self._save_json_async(SENT_ALERTS_FILE, self.sent_alerts)
@@ -401,9 +436,6 @@ class DeepSeekScanner:
         if repo_id in self.seen_repos:
             return None
 
-        self.seen_repos.add(repo_id)
-        self.stats["repos_scanned"] += 1
-
         owner = repo["owner"]["login"]
         name = repo["name"]
         branch = repo.get("default_branch", "main")
@@ -411,11 +443,16 @@ class DeepSeekScanner:
 
         tree_data = await self.client.get_tree(owner, name, branch)
         if not tree_data or "tree" not in tree_data:
+            # 失败不写入 seen_repos，下次还会重试
             return (full_name, 0)
+
+        # 只有成功拿到 tree 后才标记为已扫描
+        self.seen_repos.add(repo_id)
+        self.stats["repos_scanned"] += 1
 
         target_files = [
             it["path"] for it in tree_data["tree"]
-            if it.get("type") == "blob" and self._is_target_file(it["path"])
+            if it.get("type") == "blob" and self._is_target_file(it["path"], it.get("size", 0))
         ][:150]
 
         if not target_files:
@@ -499,7 +536,7 @@ class DeepSeekScanner:
                     result = await self.process_repo(repo)
                 except Exception as e:
                     logger.error(f"仓库处理异常: {e}")
-                    result = (f"{repo.get('owner',{}).get('login','?')}/{repo.get('name','?')}", 0)
+                    result = (f"{repo.get('owner', {}).get('login', '?')}/{repo.get('name', '?')}", 0)
 
             async with progress_lock:
                 completed += 1
@@ -556,7 +593,7 @@ class DeepSeekScanner:
 
 async def main():
     token_pool = TokenPool(GITHUB_TOKENS)
-    logger.info(f"🚀 DeepSeek 全网盲扫机 3.2 启动 | Tokens: {len(GITHUB_TOKENS)} | 关键词: {len(AI_KEYWORDS)}")
+    logger.info(f"🚀 DeepSeek 全网盲扫机 3.3 启动 | Tokens: {len(GITHUB_TOKENS)} | 关键词: {len(AI_KEYWORDS)}")
     logger.info(f"📡 日志 Webhook: {'已配置' if WECOM_LOG_WEBHOOK else '未配置'}")
     logger.info(f"🚨 告警 Webhook: {'已配置' if WECOM_ALERT_WEBHOOK else '未配置'}")
 
@@ -565,12 +602,12 @@ async def main():
 
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         await client.send_log(
-            f"🔥 **DeepSeek 全网盲扫机 3.2 启动**\n"
+            f"🔥 **DeepSeek 全网盲扫机 3.3 启动**\n"
             f"> 启动时间: {ts}\n"
             f"> GitHub Tokens: **{len(GITHUB_TOKENS)}** 个\n"
             f"> 关键词矩阵: **{len(AI_KEYWORDS)}** 个\n"
             f"> 架构: asyncio + aiohttp 全异步\n"
-            f"> 新增特性: 告警去重过滤 + 智能抖动退避重试\n"
+            f"> 修复: 仓库去重时机 + Token 配额回滚 + 搜索限流 + 大文件过滤\n"
             f"> 搜索范围: 低星(<20) + 最近30天更新\n"
             f"> 日志推送: ✅ 已就绪\n"
             f"> 告警推送: ✅ 已就绪"
@@ -586,7 +623,8 @@ async def main():
                 )
                 await asyncio.sleep(5)
 
-            await asyncio.sleep(0.1)
+            # 每轮结束后休息，降低被 Search 限流概率
+            await asyncio.sleep(ROUND_SLEEP)
 
 
 if __name__ == "__main__":
