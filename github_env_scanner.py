@@ -21,15 +21,25 @@ from aiohttp import ClientTimeout, TCPConnector
 # 配置参数
 # ==========================================
 DEFAULT_TOKENS = (
-    "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"
+    "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",
+    "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",
+    # "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",
+    "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",
+    "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",
+    "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"
 )
 
 # ---- 双 Webhook 配置 ----
 DEFAULT_LOG_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=64eea423-1a95-482b-b5ed-05339da5c819"
 DEFAULT_ALERT_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=e0778177-d8de-4f4d-8866-3471f6e7cc67"
 
-GITHUB_TOKENS_ENV = os.getenv("GITHUB_TOKENS", DEFAULT_TOKENS)
-GITHUB_TOKENS = [t.strip() for t in GITHUB_TOKENS_ENV.split(",") if t.strip()]
+GITHUB_TOKENS_ENV = os.getenv("GITHUB_TOKENS", "")
+if GITHUB_TOKENS_ENV.strip():
+    # 环境变量存在时支持逗号 / 换行 / 空格分隔
+    GITHUB_TOKENS = [t.strip() for t in re.split(r"[,\s]+", GITHUB_TOKENS_ENV) if t.strip()]
+else:
+    # 未配置环境变量时使用默认令牌池（tuple，无需 split）
+    GITHUB_TOKENS = [t.strip() for t in DEFAULT_TOKENS if t.strip()]
 WECOM_LOG_WEBHOOK = os.getenv("WECOM_LOG_WEBHOOK", DEFAULT_LOG_WEBHOOK)
 WECOM_ALERT_WEBHOOK = os.getenv("WECOM_ALERT_WEBHOOK", DEFAULT_ALERT_WEBHOOK)
 
