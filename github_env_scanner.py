@@ -21,12 +21,12 @@ from aiohttp import ClientTimeout, TCPConnector
 # 配置参数
 # ==========================================
 DEFAULT_TOKENS = (
-    "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",
-    "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",
+    "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",
+    "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",
     # "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",
-    "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",
-    "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",
-    "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"
+    "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",
+    "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",
+    "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"
 )
 
 # ---- 双 Webhook 配置 ----
